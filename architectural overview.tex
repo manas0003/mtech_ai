@@ -1,0 +1,394 @@
+\documentclass[a4paper,12pt]{article}
+
+% XeLaTeX: UTF-8 native; do NOT load inputenc
+\usepackage{fontspec}
+\usepackage{polyglossia}
+\setmainlanguage{english}
+\setotherlanguage{bengali}
+
+% Set a Bengali font (try Serif first, then Sans as fallback)
+\IfFontExistsTF{Noto Serif Bengali}{
+  \newfontfamily\bengalifont[Script=Bengali]{Noto Serif Bengali}
+}{
+  \newfontfamily\bengalifont[Script=Bengali]{Noto Sans Bengali}
+}
+
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{enumitem}
+\setlist{nosep}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref} % keep hyperref late
+
+\begin{document}
+
+\title{Architectural overview}
+\author{}
+\date{}
+\maketitle
+
+\section*{Architectural overview—}
+
+\subsection*{Core Innovation: Tri-Modal Adversarial Transparency Network (TATN)}
+
+\section*{Revolutionary Architecture Components}
+
+\begin{enumerate}
+    \item \textbf{Dynamic Span-Sense Co-Detection Module (DSCD)}
+    
+    Novel Innovation: Unlike traditional two-stage approaches, this module simultaneously learns span detection and sense disambiguation in a shared embedding space using contrastive multi-task learning
+
+    Unique Feature: Employs \textbf{uncertainty-aware attention} that dynamically adjusts focus based on contextual ambiguity levels
+
+    Technical Breakthrough: Uses \textbf{semantic density clustering} to identify homograph candidates without predefined sense inventories
+
+    \item \textbf{Adversarial Sense Balance Network (ASBN)}
+
+    Revolutionary Approach: Implements \textbf{hierarchical adversarial training} with three discriminators:
+
+    \begin{itemize}
+        \item Frequent-sense discriminator (combats bias toward common meanings)
+        \item Context-sparse discriminator (handles minimal context scenarios)
+        \item Cross-lingual sense discriminator (ensures translation consistency)
+    \end{itemize}
+
+    Novel Technique: \textbf{Gradient reversal with confidence weighting} prevents over-reliance on statistical artifacts
+
+    \item \textbf{Transparent Rationale Generator (TRG)}
+
+    Unprecedented Feature: Generates human-interpretable explanations for disambiguation decisions in real-time
+
+    Innovation: Uses \textbf{attention-based evidence extraction} combined with \textbf{natural language rationale synthesis}
+
+    Unique Capability: Provides confidence scores and alternative sense rankings with linguistic justification
+\end{enumerate}
+
+\bigskip
+
+\section*{A. Homograph detection and disambiguation : Dynamic Span-Sense Co-Detection Module (DSCD)}
+
+\textbf{Novel Innovation:} Unlike traditional two-stage approaches, this module simultaneously learns span detection and sense disambiguation in a shared embedding space.
+
+\textbf{Unique Feature:} Employs \textbf{uncertainty-aware attention} that dynamically adjusts focus based on contextual ambiguity levels
+
+\textbf{Technical Breakthrough:} Uses \textbf{semantic density clustering} to identify homograph candidates without predefined sense inventories
+
+\subsection*{Dynamic Span-Sense Co-Detection Module (DSCD)}
+
+\textbf{Goal:} Jointly detect spans of homographs and disambiguate their senses in real-time using a single neural model.
+
+\begin{itemize}
+    \item Sentence Tokenization
+    \item Normalization \& Cleaning
+    \item Subword Segmentation (SentencePiece)
+    \item Build Contextual Embedding
+    \item Uncertainty-Aware Attention --- focus the model’s attention on potentially ambiguous words (homographs) using uncertainty.
+\end{itemize}
+
+For each embedding, predict its probability distribution over possible word translations/senses (e.g., softmax output).
+
+Calculate uncertainty score for each token via entropy. The attention mechanism internally can focus more on tokens with higher entropy to guide the span detector head in identifying ambiguous words. Low Uncertainty means the model is confident: likely unambiguous.
+
+\paragraph{Dynamic Span Detection:} Set a threshold value for uncertainty.
+
+If Uncertainty value $>$ threshold value then it is flagged as an ambiguous word in that context.
+
+\paragraph{Attention Adjustment:} The encoder can give greater attention weight to tokens where Uncertainty is high, meaning that potentially ambiguous tokens exert more influence during context modeling and decision making.
+
+\paragraph{Semantic Clustering (Unsupervised):} During model development, cluster contextual embeddings of all occurrences of high-uncertainty tokens into $K$ clusters, means:
+
+\begin{itemize}
+    \item For each ambiguous word in the vocabulary (e.g., \textbengali{পাতা} = "leaf/page/blade"):
+    \begin{itemize}
+        \item Collect all contextual embeddings from various contexts in the corpus.
+        \item Cluster embeddings (e.g., using KMeans) into $K$ sense clusters (e.g., cluster 0: "leaf", cluster 1: "page", cluster 2: "blade").
+        \item Save cluster centroids and assign cluster IDs as pseudo-gold sense labels for these word instances.
+    \end{itemize}
+\end{itemize}
+
+\paragraph{Span and Sense Multi-Task Prediction:}
+
+For each token it formulates the joint prediction of:
+
+\begin{itemize}
+    \item \textbf{Span Detector Head:} For each token, predict a binary label $\{0,1\}$ indicating whether that token is ambiguous (homograph) in the sentence (1 = ambiguous, 0 = unambiguous).
+    \item \textbf{Sense Classifier Head:} Predicts sense cluster ID for ambiguous tokens. For tokens flagged ambiguous, predict its numeric sense cluster $\in\{1,\ldots,K\}$ where $K$ is the number of discovered sense clusters (e.g., 3 for \textbengali{পাতা}).
+\end{itemize}
+
+Both heads share the same contextual embedding representation of tokens, enabling efficient, joint learning.
+
+\paragraph{Sense-Augmented Representation for Translation:}
+
+\textbf{Enrich Token Representation:}
+
+For flagged ambiguous tokens, the model adds the embedding of the assigned sense cluster to the token embedding.
+
+This creates a sense-aware contextual vector for use by the translation decoder.
+
+\paragraph{Sense-Aware Decoding:} The decoder receives all (sense-enhanced) token embeddings. And based on it, the model translates the sentence from Bengali to English.
+
+\bigskip
+
+\section*{B. Adversarial Sense Balance Network (ASBN)}
+
+\textbf{Approach:} Implements hierarchical adversarial training with three discriminators:
+
+\begin{itemize}
+    \item Frequent-sense discriminator (combats bias toward common meanings): Detects when the encoder’s sense predictions follow frequency statistics (e.g., always picking the most common sense). It forces the encoder to “hide” sense-frequency patterns, encouraging true context-driven predictions.
+\end{itemize}
+
+\paragraph{Example}
+
+Let’s say the Bengali word \textbf{\textbengali{পাতা}} most often means "leaf" in training data, but can also mean "page" (of a book), "blade" (of a knife), or "card" (as in playing card):
+
+\begin{itemize}
+    \item Sentence 1: \textbengali{গাছের পাতা সবুজ।} (“The leaf of the tree is green.”) — Context really does demand “leaf”.
+    \item Sentence 2: \textbengali{সে পাতা দিল।} (“He gave the \textbengali{পাতার}.” — ambiguous; could be “card”, “leaf”, “page”)
+    \item Sentence 3: \textbengali{বইয়ের পাতা ছেঁড়া।} (“The page of the book is torn.”) — Context demands “page”, but “leaf” is the most common overall.
+\end{itemize}
+
+\paragraph{What the Discriminator Does}
+
+It receives the sense prediction (\textbengali{পাতা} = "leaf").
+
+It checks if this matches the most frequent overall sense.
+
+If it can predict the model’s sense choice without looking at the context (pure frequency), that reveals the encoder is not using rich context — it’s “lazy.”
+
+When this happens, a gradient reversal penalty is applied, forcing the encoder (DSCD) to refine its context use so senses are less predictable by frequency alone.
+
+\bigskip
+
+\textbf{Context-sparse discriminator (handles minimal context scenarios):} Detects if the encoder is “guessing” or relying on patterns when the local context is vague or insufficient. Encourages the encoder to attend harder to global or subtle cues — not just generic patterns.
+
+\paragraph{Example}
+
+Suppose the sentence is very short or does not contain distinctive context words:
+
+\begin{itemize}
+    \item Sentence 4: \textbengali{পাতা পড়ল।}
+\end{itemize}
+
+This sentence could mean “The leaf fell,” “The card fell,” or even “The page fell,” depending on situation.
+
+\paragraph{What the Discriminator Does}
+
+It identifies such cases of sparse or ambiguous context.
+
+It analyzes whether DSCD always chooses the most frequent sense (e.g., “leaf”).
+
+If so, it penalizes the encoder for not expressing enough uncertainty, not looking for global cues, or just exploiting data priors.
+
+This forces the model to be cautious, to signal ambiguity, or to search for less obvious contextual evidence.
+
+\bigskip
+
+\textbf{Cross-lingual sense discriminator (ensures translation consistency):} Detects mismatches between source and target sense choices (e.g., translating to a less-specific or wrong sense in the target language). It keeps the translated sense aligned, especially when ambiguous words have different sense frequencies across languages.
+
+\paragraph{Example}
+
+\begin{itemize}
+    \item Sentence 5: \textbengali{বইয়ের পাতা ছেঁড়া।} Suppose the encoder’s sense prediction for \textbengali{পাতা} is “leaf” (wrong), but the target translation should be “page.”
+    \item Sentence 6: \textbengali{ছুরির পাতা ধারালো।} (“The blade of the knife is sharp.”) The model predicts “leaf” (wrong), but correct would have been “blade”.
+\end{itemize}
+
+\paragraph{What the Discriminator Does}
+
+It compares the predicted Bengali sense for \textbengali{পাতা} with the semantic role of the word in the English sentence.
+
+If it sees systematic mismatches, it adversarially penalizes the encoder, forcing future representations to better align semantic senses across source and target.
+
+This reduces translation errors caused by sense collapse or divergence.
+
+\bigskip
+
+\subsection*{ASBN (Adversarial Sense Balance Network) architectural Overview:}
+
+Model Foundation: DSCD Module: Predicts, for each potentially ambiguous token, a sense cluster among $K$ choices using context and clustering, and detects ambiguous spans.
+
+ASBN: Frequent-Sense Discriminator, Context-Sparse Discriminator, Cross-Lingual Sense Alignment Discriminator — all these act as ``bias detectors'' — each trying to spot a systematic error.
+
+\paragraph{Steps:}
+
+\begin{description}
+    \item[Frequent-Sense Discriminator (D\textsubscript{freq})] For each ambiguous token:
+    \begin{itemize}
+        \item Get the sense prediction (one of $K$ clusters).
+        \item The discriminator $D_{\text{freq}}$ gets as input: The context embedding \& The sense assignment.
+        \item $D_{\text{freq}}$ tries to predict whether the most frequent is the most frequent sense (binary label: 1 for most frequent, 0 otherwise).
+    \end{itemize}
+
+    \item[Context-Sparse Discriminator (D\textsubscript{ctx})] Detects if the DSCD is ignoring weak context (making a guess where not enough information is present).
+    \begin{itemize}
+        \item It takes input: The context length for the ambiguous word \& The token embedding and sense assignment.
+        \item Predicts if the context is ``sparse'' (binary label: 1 for sparse, 0 for rich) and if sense assignment matches sparse-context frequency.
+    \end{itemize}
+
+    \item[Cross-Lingual Sense Alignment Discriminator (D\textsubscript{xl})] Checks if the predicted Bengali sense maps correctly to the English translation’s sense, enforcing cross-lingual consistency.
+    \begin{itemize}
+        \item For each ambiguous source token $w$: Identify predicted sense, extract the aligned English token’s embedding.
+        \item $D_{\text{xl}}$ tries to predict if the target translation corresponds to the same sense cluster.
+    \end{itemize}
+\end{description}
+
+\paragraph{D. Confidence-Weighted Gradient Reversal}
+
+Compute confidence for each sense assignment (e.g., softmax probability $p_{\max}$ from the sense head).
+
+Scale each adversarial loss by model confidence:
+
+\begin{itemize}
+    \item More confident, more adversarial penalty.
+    \item Less confident (uncertain), less penalty.
+\end{itemize}
+
+\paragraph{E. Training Objective and Optimization}
+
+All networks are updated jointly using backpropagation, with special gradient reversal in the adversarial branches.
+
+\bigskip
+
+\section*{TRG: Transparent Rationale Generator}
+
+TRG makes model’s disambiguation and translation decisions truly interpretable and transparent by automatically generating human-readable explanations — claiming, evidencing, and justifying every sense decision made by DSCD (and improved by ASBN). The result is a translation system that not only outputs the answer, but also \textbf{tells} in clear language \textbf{why} it made each ambiguous word choice.
+
+\subsection*{1. Joint Explanation Extraction and Synthesis (Rationale-in-the-Loop)}
+
+While most explanation models merely show token-level attention heatmaps or post-hoc templates, TRG in TATN dynamically and jointly:
+
+\begin{itemize}
+    \item Extracts salient context tokens (words or phrases most influential for a sense decision), using both attention weights and uncertainty/entropy scores from DSCD.
+    \item Synthesizes natural-language rationales via a lightweight, context-conditioned sequence generator.
+\end{itemize}
+
+\paragraph{How It's Different and Novel}
+
+Not just showing attention weights. TRG produces fluent explanations, not just highlight overlays.
+
+Conditioned on sense decisions AND adversarial context. The rationale generation is guided by not just ``why this sense,'' but also ``why not the others'' — with uncertainty and ASBN audit scores as explicit context for the generation.
+
+Handles rare, overlapping, or unseen senses. It can explain away why a non-frequent or rare cluster is chosen, using context tokens and even mentioning ASBN ``criticisms.''
+
+\subsection*{Concrete Example: Bengali \textbengali{মূল} ("mool")}
+
+Ambiguous word: \textbengali{মূল} (possible senses: root (plant), price, radical/square root, origin/source).
+
+Input sentence:
+\begin{quote}
+\textbengali{৯ এর বর্গমূল হল ৩।}\\
+("The square root of 9 is 3.")
+\end{quote}
+
+\paragraph{Step-by-Step Novel TRG Process}
+
+\begin{enumerate}
+    \item \textbf{Collect Sense Decision \& Contextual Cues}
+
+    DSCD predicts for \textbengali{মূল} in this context:
+
+    Sense cluster: radical/math root (from \textbengali{বর্গমূল}, \textbengali{৯}, \textbengali{৩})
+
+    Model’s confidence: e.g., 95\%
+
+    Salient context tokens by attention: \textbengali{বর্গ} (square), numerals
+
+    (ASBN during training): minimal bias detected, strong context
+
+    \item \textbf{Prepare Explanation Inputs}
+
+    Chosen sense and alternatives:
+
+    Chosen: radical/math root
+
+    Alternatives: root (plant), price, origin
+
+    Salient context: \textbengali{বর্গ}, \textbengali{৯}, \textbengali{৩}
+
+    Reasoning for exclusion: No plant/sale/foundation words; mathematical terms dominate.
+
+    \item \textbf{Generate Natural Language Rationale}
+
+    TRG’s sequence generator (small, specialized neural module) uses:
+
+    \begin{itemize}
+        \item What context tokens were crucial (\textbengali{বর্গ}, \textbengali{৯}, \textbengali{৩})
+        \item Which sense was chosen, and confidence
+        \item Why other senses were not chosen (no plant or price words in this context)
+        \item Optionally, any detected uncertainty or adversarial audit remarks
+    \end{itemize}
+\end{enumerate}
+
+\bigskip
+
+\section*{Step by step implementation of TRG module:}
+
+\paragraph{Word Example: \textbengali{মূল} (mool)}
+
+Senses:
+\begin{itemize}
+    \item Root (of a plant)
+    \item Price (of a thing)
+    \item Radical/square root (math)
+    \item Origin/source/foundation
+\end{itemize}
+
+Sample Sentence for Disambiguation:
+
+\begin{quote}
+\textbengali{এই বইয়ের মূল কত?}\\
+(“What is the price of this book?”)
+\end{quote}
+
+\subsection*{1. Collect Model Decisions and Internal Signals}
+
+\textbf{a) Get DSCD Outputs for \textbengali{মূল}}
+
+Sense prediction: Price (from context \textbengali{বইয়ের} / “of the book” and \textbengali{কত} / “how much”)
+
+Sense probabilities (softmax): [0.08 (root), 0.86 (price), 0.03 (radical), 0.03 (origin)]
+
+Model confidence: 86\% for "price"
+
+Ambiguity flagged: Yes (from DSCD’s span head)
+
+\textbf{b) Context Saliency Extraction}
+
+Use attention weights \& context cues:
+
+Most salient: \textbengali{বইয়ের} (of the book), \textbengali{কত} (how much), presence of question structure
+
+No plant, math, or origin/foundation words
+
+\textbf{c) (Optional, Training Only) ASBN Audit Info}
+
+ASBN confirms: Not defaulting to most frequent sense ("root"); choosing “price” because context cues are strong
+
+\subsection*{2. Build Structured Input for the Rationale Generator}
+
+Inputs to TRG:
+
+\begin{itemize}
+    \item Token: \textbengali{মূল}
+    \item Chosen sense: Price
+    \item Top context clues: \textbengali{বইয়ের}, \textbengali{কত}
+    \item Sense probabilities \& confidence
+    \item Alternative senses not chosen (and reason: missing context cues)
+    \item ASBN bias score (if relevant) and uncertainty
+    \end{itemize}
+
+\subsection*{3. Generate Fluent Explanation (Rationale Generator Module)}
+
+Model:
+Use a lightweight sequence-to-sequence generator (small Transformer, GRU, or template-augmented model) specially trained/tuned to verbalize:
+
+\begin{itemize}
+    \item Why this sense was picked ("price")
+    \item Evidence from context (words, question form)
+    \item Why other senses were rejected (e.g., “No plant/math/origin context words nearby”)
+    \item Model’s certainty
+    \item (If relevant) "Critiqued" decisions (e.g., "Most frequent sense not chosen thanks to supporting evidence")
+\end{itemize}
+
+\end{document}

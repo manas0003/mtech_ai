@@ -1,0 +1,194 @@
+\documentclass[a4paper,11pt]{article}
+
+% XeLaTeX + Unicode fonts
+\usepackage{fontspec}
+\setmainfont{Times New Roman} % English font
+\newfontfamily\bengalifont{Noto Serif Bengali} % Bengali font (install if missing)
+
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\geometry{top=1in, bottom=1in, left=1in, right=1in}
+
+\title{Transparent Rationale Generator (TRG) \\ Pseudocode, Formulation, and Explanations}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Notation and Glossary}
+
+\begin{tabular}{ll}
+\toprule
+Symbol & Meaning \\
+\midrule
+$S = [s_1, \dots, s_L]$ & Input sentence tokens \\
+$h_j \in \mathbb{R}^d$ & Contextual embedding of token $j$ \\
+$w_j$ & Type (word/subword group) of token $j$ \\
+$C_w = \{c_{w,1}, \dots, c_{w,K_w}\}$ & Prototype centroids for type $w$ \\
+$\text{sim}_{j,i}$ & Cosine similarity between $h_j$ and prototype $c_{w,i}$ \\
+$p_j$ & Softmax distribution over senses for token $j$ \\
+$p_{\max}$ & Maximum probability in $p_j$ \\
+$\hat{y}$ & Argmax sense index (chosen sense) \\
+$H(p_j)$ & Entropy of distribution $p_j$ \\
+$\text{Var}_{p_j}$ & MC-dropout variance across predictions \\
+$\sigma_j$ & Aleatoric uncertainty predicted by $\sigma$-Net \\
+$d^{\min}_j$ & Distance to nearest prototype \\
+$U_j$ & Normalized aggregated uncertainty score \\
+$g_j$ & Gate indicating whether token needs explanation \\
+$E_j$ & Extracted evidence tokens \\
+$\text{ASBN\_diag}_j$ & Diagnostic signals from ASBN discriminators \\
+$G$ & Generator model (structured input $\to$ rationale text) \\
+$V$ & Verifier model (source + rationale $\to$ sense distribution) \\
+\bottomrule
+\end{tabular}
+
+\section{Mathematical Formulation}
+
+\subsection{Prototype-based sense distribution}
+\[
+\text{sim}_{j,i} = \cos(h_j, c_{w,i}), \quad
+p_j = \text{softmax}\left(\frac{\text{sim}_j}{T}\right)
+\]
+
+\subsection{Entropy (normalized)}
+\[
+H_j = - \sum_i p_j[i] \log(p_j[i] + \epsilon), \quad
+H_{\text{norm}} = \frac{H_j}{\log K_w}
+\]
+
+\subsection{MC-dropout variance (epistemic)}
+\[
+\mu_p = \frac{1}{M} \sum_m p_j^{(m)}, \quad
+\text{Var}_{p_j} = \frac{1}{M} \sum_m \|p_j^{(m)} - \mu_p\|^2
+\]
+
+\subsection{Aleatoric uncertainty}
+\[
+\text{aleatoric}_j = e^{s_j}, \quad
+\text{aleatoric}_{\text{norm}} = \frac{\text{aleatoric}_j}{\text{aleatoric}_j + c}
+\]
+
+\subsection{Novelty to prototypes}
+\[
+d^{\min}_j = \min_i (1 - \text{sim}_{j,i}), \quad
+d^{\text{norm}}_j = \sigma\!\left(\gamma \cdot \frac{d^{\min}_j - \mu_d}{\sigma_d + \epsilon}\right)
+\]
+
+\subsection{Aggregate uncertainty}
+\[
+U_j = \sigma\!\left(\kappa \cdot \Big( \alpha_H H_{\text{norm}} +
+\alpha_{\text{var}} \text{Var}_{p_j} +
+\alpha_a \text{aleatoric}_{\text{norm}} +
+\alpha_d d^{\text{norm}}_j - \tau_U \Big)\right)
+\]
+
+\section{TRG Training Algorithm (Silver-Only)}
+
+\begin{algorithm}[H]
+\caption{TRG Training with Silver Rationales}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Training corpus, DSCD+ASBN outputs
+\STATE \textbf{Output:} Generator $G$, Verifier $V$
+\STATE Run DSCD+ASBN to compute $h_j, p_j, U_j, E_j, \text{ASBN\_diag}_j$
+\FOR{each token $j$ flagged (if $U_j > \tau_U$)}
+    \STATE Extract evidence tokens $E_j$ from attention
+    \STATE Select top alternative senses $\text{Alts}_j$
+    \STATE Collect prototype examples $\text{ProtoEx}_j$
+    \STATE Summarize audit diagnostics $\text{Audit}_j$
+    \STATE Format structured input $X_j$
+    \STATE Build silver rationale $R_j = \text{Template}(X_j)$
+    \STATE Add $(X_j, R_j, \hat{y})$ to training set
+\ENDFOR
+\STATE Initialize $G, V$
+\FOR{epoch = 1 to $E$}
+    \FOR{batch $(X, R, y)$}
+        \STATE $L_{\text{gen}} \gets$ CrossEntropy($G(X), R$)
+        \STATE $q \gets V(S \oplus R)$
+        \STATE $L_{\text{fid}} \gets$ CrossEntropy($q, y$)
+        \STATE $L_{\text{cov}} \gets$ CoverageLoss($G(X), E$)
+        \STATE $L \gets L_{\text{gen}} + \lambda_{\text{fid}} L_{\text{fid}} + \lambda_{\text{cov}} L_{\text{cov}}$
+        \STATE Update $G, V$ by backpropagation
+    \ENDFOR
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\section{TRG Inference Algorithm}
+
+\begin{algorithm}[H]
+\caption{TRG Inference (Runtime)}
+\begin{algorithmic}[1]
+\STATE \textbf{Input:} Sentence $S$, DSCD outputs
+\FOR{each token $j$}
+    \IF{$p_{\max} > \tau_{\text{high}}$ \AND $U_j < \tau_{\text{low}}$}
+        \STATE $R_j \gets \text{Template}(X_j)$
+    \ELSE
+        \STATE Generate candidates $R^c = G(X_j)$
+        \FOR{each $r \in R^c$}
+            \STATE $q = V(S \oplus r)$
+            \IF{$\arg\max q = \hat{y}$ \AND $q[\hat{y}] > \text{threshold}$}
+                \STATE $R_j \gets r$, break
+            \ENDIF
+        \ENDFOR
+        \IF{no candidate accepted}
+            \STATE $R_j \gets \text{Template}(X_j)$
+        \ENDIF
+    \ENDIF
+    \STATE Output $\{j, \hat{y}, p_{\max}, E_j, R_j, \text{Alts}_j, \text{ASBN\_diag}_j, U_j\}$
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\section{Detailed Explanation of Components}
+
+\subsection{Extractor}
+The extractor collects signals from DSCD and ASBN for each token. It includes contextual embeddings, probability distributions over senses, uncertainty estimates, evidence tokens from attention, prototype assignments, and diagnostic notes from discriminators. This ensures rationales are grounded in model internals.
+
+\subsection{Formatter}
+The formatter converts raw extractor outputs into structured fields such as the token, chosen sense, confidence score, alternatives, evidence tokens, prototype examples, and ASBN diagnostics. This structured format enables reliable template generation and safe input to the generator.
+
+\subsection{Template}
+The template is a deterministic slot-filler that produces a concise rationale from structured inputs. For example:
+\begin{quote}
+Chose ``page'' (conf 0.86) because {\bengalifont বইয়ের} indicates book context. Alternatives ``leaf'' (0.12) and ``blade'' (0.02) are less likely. No ASBN bias detected.
+\end{quote}
+Templates are always faithful to model signals and serve as fallback explanations when the generator is uncertain.
+
+\subsection{Generator ($G$)}
+The generator is a small seq2seq model trained on silver rationales. It rewrites structured inputs or template outputs into more natural explanations. This improves fluency while maintaining faithfulness to DSCD+ASBN signals.
+
+\subsection{Verifier ($V$)}
+The verifier is a classifier that checks whether a rationale is faithful. It predicts the sense given the sentence and rationale. If it agrees with the DSCD prediction, the rationale is accepted. This prevents fluent but misleading explanations.
+
+\subsection{Loss Terms}
+\begin{itemize}[leftmargin=*]
+\item $L_{\text{gen}}$: Cross-entropy between generator outputs and silver rationales (fluency).
+\item $L_{\text{fid}}$: Cross-entropy on verifier predictions (faithfulness).
+\item $L_{\text{cov}}$: Penalty if evidence tokens are absent in generated rationale (coverage).
+\item Total loss:
+\[
+L = L_{\text{gen}} + \lambda_{\text{fid}} L_{\text{fid}} + \lambda_{\text{cov}} L_{\text{cov}}
+\]
+\end{itemize}
+
+\subsection{Training Phase}
+During training, tokens with high uncertainty are selected. Silver rationales are generated using templates. Structured inputs and rationales form the training set. The generator and verifier are trained jointly with combined loss, ensuring both fluency and faithfulness.
+
+\subsection{Inference Phase}
+At runtime, if confidence is high and uncertainty is low, a template rationale is used. Otherwise, the generator produces candidate rationales, which are verified for faithfulness. If verification fails, fallback to template occurs. The output includes the rationale text, evidence, chosen sense, alternatives, ASBN diagnostics, and uncertainty.
+
+\subsection{Example Walkthrough}
+For the sentence: \emph{{\bengalifont "সে বইয়ের পাতায় ছবি আঁকছে।"}}, the token {\bengalifont "পাতা''} has senses [leaf:0.12, page:0.86, blade:0.02]. Evidence token = {\bengalifont "বইয়ের"}. The template rationale is:
+\begin{quote}
+Chose ``page'' (conf 0.86) because {\bengalifont বইয়ের} indicates book context. Alternatives "leaf'' (0.12) and ``blade'' (0.02) are less likely.
+\end{quote}
+The generator may produce a more fluent explanation if accepted by the verifier.
+
+\end{document}

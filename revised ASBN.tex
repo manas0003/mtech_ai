@@ -1,0 +1,339 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{Revised ASBN Algorithm\\ \small{Adversarial Sense Balance Network (training-time)}}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Notation (short)}
+\begin{description}[leftmargin=2.5em]
+  \item[$j$] index for a token instance in the current batch.
+  \item[$w_j$] token type (word / subword) for token $j$.
+  \item[$h_j \in \mathbb{R}^d$] contextual encoder vector for token $j$ (output of DSCD encoder).
+  \item[$p_j \in \Delta^{K_{w_j}-1}$] DSCD soft distribution over $K_{w_j}$ prototypes for type $w_j$.
+  \item[$\hat{y}_j = \arg\max_k p_{j,k}$] DSCD predicted sense id for token $j$.
+  \item[$p_{\max}(j) = \max_k p_{j,k}$] model confidence (top probability).
+  \item[$U_j \in [0,1]$] combined uncertainty score for token $j$ (entropy, MC-var, $\sigma$-Net, novelty normalized).
+  \item[$g_j \in \{0,1\}$] DSCD gate / flag (1 if token is flagged ambiguous and requires ASBN attention).
+  \item[$F_w$] empirical type-level sense frequency vector for token type $w$ from training corpus.
+  \item[$z^{\mathrm{tgt}}_{a(j)}$] aligned target-side embedding for the source token $j$ (when available from parallel data).
+  \item[$D_{\text{freq}}, D_{\text{ctx}}, D_{\text{xl}}$] discriminators (frequency, context-sparse, cross-lingual) with parameters $\phi_{\text{freq}},\phi_{\text{ctx}},\phi_{\text{xl}}$.
+  \item[$\bar{\lambda}_{\text{freq}}, \bar{\lambda}_{\text{ctx}}, \bar{\lambda}_{\text{xl}}$] base GRL strengths for each discriminator.
+  \item[$w_{\text{freq}},w_{\text{ctx}},w_{\text{xl}}$] weights for discriminator losses in ASBN aggregation.
+  \item[$\lambda_{\text{ASBN}}$] global multiplier of ASBN loss in the full training objective.
+  \item[$\mathrm{clip}(\cdot,a,b)$] clip a scalar to the interval $[a,b]$.
+\end{description}
+
+\section{ASBN compact pseudocode}
+\begin{algorithm}[H]
+\caption{ASBN: Training-step (per batch)}
+\label{alg:asbn}
+\begin{algorithmic}[1]
+\Require Batch of tokens with DSCD outputs $\{ h_j, p_j, \hat{y}_j, p_{\max}(j), U_j, g_j, F_{w_j}, z^{\mathrm{tgt}}_{a(j)} \}$
+\Statex \textbf{Hyperparameters:} $\bar{\lambda}_k$ (base GRL for $k\in\{\text{freq,ctx,xl}\}$), $\lambda_{\max}$, $w_k$, $\lambda_{\text{ASBN}}$.
+\vspace{4pt}
+
+\State \textbf{1. Compute per-token GRL strengths (confidence-weighted).}
+\For{each token $j$ in the batch}
+    \State $\lambda_{k,j} \gets \mathrm{clip}\!\big(\bar{\lambda}_k \cdot p_{\max}(j)\cdot(1-U_j)\cdot g_j,\;0,\;\lambda_{\max}\big)$ \Comment{$k\!\in\!\{\text{freq,ctx,xl}\}$}
+\EndFor
+
+\State \textbf{2. Build discriminator inputs (via GRL).}
+\For{each token $j$}
+    \State $x_{\text{freq},j} \gets \mathrm{concat}\big(\mathrm{GRL}(h_j,\lambda_{\text{freq},j}),\;F_{w_j}\big)$
+    \State $x_{\text{ctx},j}  \gets \mathrm{concat}\big(\mathrm{GRL}(h_j,\lambda_{\text{ctx},j}),\;\text{ctx\_stats}_j,\;U_j\big)$
+    \State $x_{\text{xl},j}   \gets \mathrm{concat}\big(\mathrm{GRL}(h_j,\lambda_{\text{xl},j}),\;\mathrm{proj}(z^{\mathrm{tgt}}_{a(j)})\big)$
+\EndFor
+
+\State \textbf{3. Discriminator forward: compute per-token losses.}
+\State $L_{\text{freq}} \gets \frac{1}{N}\sum_j \mathrm{CE}\big(D_{\text{freq}}(x_{\text{freq},j}),\; y^{\text{freq}}_j\big)$
+\State $L_{\text{ctx}}  \gets \frac{1}{N}\sum_j \mathrm{CE}\big(D_{\text{ctx}}(x_{\text{ctx},j}),\; y^{\text{ctx}}_j\big)$
+\State $L_{\text{xl}}   \gets \frac{1}{N}\sum_j \mathrm{ContrastiveOrCE}\big(D_{\text{xl}}(x_{\text{xl},j}),\; z^{\mathrm{tgt}}_{a(j)},\; \text{neg}_j\big)$
+
+\State \textbf{4. Aggregate ASBN loss.}
+\State $L_{\text{ASBN}} \gets w_{\text{freq}}L_{\text{freq}} + w_{\text{ctx}}L_{\text{ctx}} + w_{\text{xl}}L_{\text{xl}}$
+
+\State \textbf{5. Update discriminators (minimize $L_{\text{ASBN}}$).}
+\State $\phi \gets \phi - \eta_\phi \nabla_\phi L_{\text{ASBN}}$
+
+\State \textbf{6. Compute primary model losses (DSCD + NMT).}
+\State $L_{\text{MT}} \gets \text{translation loss (decoder)}$
+\State $L_{\text{span}} \gets \text{BCE(span head)}$
+\State $L_{\text{sense}} \gets \text{CE or contrastive sense loss}$
+
+\State \textbf{7. Update encoder \& decoder (GRL supplies reversed gradients).}
+\State $L_{\text{total}} \gets L_{\text{MT}} + \lambda_{\text{span}}L_{\text{span}} + \lambda_{\text{sense}}L_{\text{sense}} + \lambda_{\text{ASBN}}L_{\text{ASBN}}$
+\State $\theta \gets \theta - \eta_\theta \nabla_\theta L_{\text{total}}$
+\State \textbf{(Note: GRL negates \& scales discriminator gradients en route to $\theta$.)}
+\end{algorithmic}
+\end{algorithm}
+
+\section{Step-by-step explanation}
+\textbf{1. Counterfactual Pair Generator (CPG).}  
+Creates artificial counterfactual examples to expose model shortcuts.  
+\emph{Example:} For the sentence ``The bank is full of people'', generate:  
+(a) freq-swap: replace ``bank'' with less frequent sense (river bank);  
+(b) context-lift: add clarifying phrase (``financial institution'');  
+(c) xling-swap: deliberately mistranslate ``bank'' in the target.  
+\emph{Why:} Helps discriminators learn to catch frequency, context, and alignment biases.\\
+
+\textbf{2. Bank of Orthogonal Auditors.}  
+Multiple specialized critics instead of one adversary:  
+- A-FREQ (frequency bias),  
+- A-CTX (context insensitivity),  
+- A-XL (cross-lingual mismatch),  
+- A-PS (prototype stability auditor),  
+- A-SC (spurious cue auditor, e.g. punctuation/digits).  
+\emph{Example:} If the model always picks ``financial bank'' regardless of context, A-FREQ flags it.  
+\emph{Why:} Allows targeted correction of different shortcut types.\\
+
+\textbf{3. Optimal-Transport Sense Balancer (OT-SB).}  
+Smooths predicted sense probabilities to avoid majority-sense collapse.  
+\emph{Example:} For ``bass'', if context is unclear, OT-SB enforces near-uniform distribution between fish and instrument senses.  
+\emph{Why:} Encourages fair treatment of senses when evidence is weak, while respecting strong context when available.\\
+
+\textbf{4. Primal--Dual No-Regret Multiplier Allocation.}  
+Adapts weights for each auditor dynamically.  
+\emph{Example:} If 70\% of errors come from frequency bias, the system increases weight for A-FREQ during training.  
+\emph{Why:} Automatically shifts adversarial pressure to the shortcut causing most harm.\\
+
+\textbf{5. Editability Guard (E-GUARD).}  
+Checks whether the model’s fixes are genuine semantic corrections or superficial hacks.  
+\emph{Example:} If ``bass'' is disambiguated only by looking at suffix ``-s'', E-GUARD penalizes it; if it uses deeper context like ``guitar'', E-GUARD rewards it.  
+\emph{Why:} Promotes durable, meaning-based corrections instead of surface tricks.\\
+
+\textbf{6. Retrieval-in-the-Loop (ARIL).}  
+Retrieves external glosses or examples for weak contexts. Includes an auditor that ensures the model does not overfit to the retrieval source.  
+\emph{Example:} For ``jaguar'', ARIL retrieves examples for both the animal and the car. Auditor ensures predictions depend on context, not retrieval source idiosyncrasies.  
+\emph{Why:} Strengthens disambiguation with external context while preserving robustness.\\
+
+
+Below each numbered step from the pseudocode is explained: \textbf{what} the step does, \textbf{why} it is necessary, and \textbf{how} to implement it (practical tips).
+
+\subsection*{Step 1: Compute per-token GRL strengths (confidence-weighted)}
+\paragraph{What}
+For each token $j$ and for each discriminator $k\in\{\mathrm{freq},\mathrm{ctx},\mathrm{xl}\}$ compute a scalar $\lambda_{k,j}$ that controls how strongly the discriminator's gradient will be reversed when it propagates back into the encoder.
+
+\[
+\lambda_{k,j} = \mathrm{clip}\big(\bar{\lambda}_k \cdot p_{\max}(j)\cdot (1-U_j)\cdot g_j ,\; 0,\; \lambda_{\max}\big).
+\]
+
+\paragraph{Why}
+- We want stronger adversarial pressure when the model is \emph{confident} ($p_{\max}$ high) but \emph{not genuinely uncertain} ($U_j$ low). That indicates a confident-but-possibly-wrong shortcut.  
+- We apply ASBN only to tokens DSCD flagged as ambiguous ($g_j=1$) to focus compute.  
+- Clipping $\lambda_{k,j}$ stabilizes training.
+
+\paragraph{How (practical)}
+- Compute $p_{\max}(j)$ as $\max_k p_{j,k}$.  
+- Combine DSCD uncertainty signals into $U_j\in[0,1]$ beforehand (entropy normalized + MC-var + $\sigma$-Net + novelty distance).  
+- Implement clipping and optionally use a small smoothing (e.g., add $10^{-6}$) to avoid zero division in other parts.  
+- Set base values like $\bar{\lambda}_{\text{freq}}=1.0$, $\bar{\lambda}_{\text{ctx}}=0.5$, $\bar{\lambda}_{\text{xl}}=0.8$, and $\lambda_{\max}=2.0$ to start; tune later.
+
+\subsection*{Step 2: Build discriminator inputs via GRL}
+\paragraph{What}
+Create the input vectors for each discriminator by sending $h_j$ through a GRL (with $\lambda_{k,j}$) and concatenating small side-features appropriate to each discriminator:
+\begin{itemize}
+  \item $D_{\text{freq}}$: $\mathrm{GRL}(h_j,\lambda_{\text{freq},j})$ \(\oplus\) $F_{w_j}$ (type-level priors).
+  \item $D_{\text{ctx}}$: $\mathrm{GRL}(h_j,\lambda_{\text{ctx},j})$ \(\oplus\) context statistics \(\oplus\) $U_j$.
+  \item $D_{\text{xl}}$: $\mathrm{GRL}(h_j,\lambda_{\text{xl},j})$ \(\oplus\) projected aligned target embedding.
+\end{itemize}
+
+\paragraph{Why}
+Discriminators require both the representation (so they can learn to exploit shortcuts) and a minimal set of side information which signals the specific shortcut to watch for (e.g., frequency vector for $D_{\text{freq}}$). Using small, interpretable features prevents discriminators from overpowering the encoder with huge capacity.
+
+\paragraph{How}
+- \textbf{GRL:} use a GRL layer from your framework (PyTorch implementations exist) or implement manually: forward is identity, backward multiplies gradients by $-\lambda$. If per-sample $\lambda$ support is unavailable, see the "per-sample GRL alternative" note below.  
+- \textbf{Feature prep:} $F_{w_j}$ can be a normalized histogram of sense counts or simply index-of-majority. $\text{ctx\_stats}_j$ can be sentence length, number of nearby content tokens, average attention mass, POS-based counts, etc.  
+- \textbf{Projection:} apply a tiny MLP or linear projector to $z^{\mathrm{tgt}}$ before concatenation so dimensionalities align with discriminator input.
+
+\subsection*{Step 3: Discriminator forward: compute per-token losses}
+\paragraph{What}
+Run each discriminator on its inputs and compute a loss:
+\[
+\begin{aligned}
+L_{\text{freq}} &= \frac{1}{N}\sum_j \mathrm{CE}\big(D_{\text{freq}}(x_{\text{freq},j}), y^{\text{freq}}_j\big),\\
+L_{\text{ctx}}  &= \frac{1}{N}\sum_j \mathrm{CE}\big(D_{\text{ctx}}(x_{\text{ctx},j}), y^{\text{ctx}}_j\big),\\
+L_{\text{xl}}   &= \frac{1}{N}\sum_j \mathrm{ContrastiveOrCE}\big(D_{\text{xl}}(x_{\text{xl},j}),\, z^{\mathrm{tgt}}_{a(j)},\, \text{neg}_j\big).
+\end{aligned}
+\]
+
+Labels:
+\begin{itemize}
+  \item $y^{\text{freq}}_j$: binary indicator if $\hat{y}_j$ equals the majority sense of $F_{w_j}$.
+  \item $y^{\text{ctx}}_j$: binary indicator if context is sparse AND $\hat{y}_j$ matched majority (compute via heuristics).
+  \item $D_{\text{xl}}$ uses positive aligned target and negatives (wrong-sense target tokens drawn from prototypes).
+\end{itemize}
+
+\paragraph{Why}
+Each loss trains a discriminator to detect a particular shortcut. Later, the encoder will receive reversed gradients via GRL which will force the encoder to reduce the discriminators' ability to detect these shortcuts.
+
+\paragraph{How}
+- Use small MLPs (1--2 layers) for discriminators. Keep them low capacity.  
+- For $D_{\text{xl}}$ a contrastive loss (InfoNCE) often works better: positives are real aligned target embeddings, negatives are plausible wrong-sense words (sample from prototype lexicon).  
+- For $y^{\text{ctx}}_j$ you can define context-sparse as sentence length $< L_{\text{thresh}}$ or DSCD entropy $H_j$ above a threshold; choose a simple rule to avoid noise.
+
+\subsection*{Step 4: Aggregate ASBN loss}
+\paragraph{What}
+Combine the three discriminator losses into a single scalar:
+\[
+L_{\text{ASBN}} = w_{\text{freq}}L_{\text{freq}} + w_{\text{ctx}}L_{\text{ctx}} + w_{\text{xl}}L_{\text{xl}}.
+\]
+
+\paragraph{Why}
+A single aggregated term keeps integration into the overall loss simple, allows weighting the importance of each adversarial signal, and is convenient for optimizer steps.
+
+\paragraph{How}
+Start with equal weights ($w_k=1$) or if you know a particular shortcut is more harmful (e.g., frequency bias), give it more weight. Monitor training and adjust.
+
+\subsection*{Step 5: Update discriminators (minimize $L_{\text{ASBN}}$)}
+\paragraph{What}
+Use optimizer step(s) to minimize $L_{\text{ASBN}}$ w.r.t discriminator parameters $\phi$:
+\[
+\phi \leftarrow \phi - \eta_\phi \nabla_\phi L_{\text{ASBN}}.
+\]
+
+\paragraph{Why}
+Discriminators must be competent detectors, otherwise the encoder will have nothing meaningful to hide from. Keeping the discriminators up-to-date ensures the adversarial game remains informative.
+
+\paragraph{How}
+- Use a smaller learning rate for discriminators ($\eta_\phi$) than the encoder typically.  
+- Optionally perform multiple small discriminator steps per encoder step during early training (e.g., 2:1) to keep critics competitive.
+
+\subsection*{Step 6: Compute primary model losses (DSCD + NMT)}
+\paragraph{What}
+Compute the standard task losses coming from DSCD and decoder:
+\begin{itemize}
+  \item $L_{\text{MT}}$: translation loss (cross-entropy of decoder outputs vs target).
+  \item $L_{\text{span}}$: span detection loss (binary cross-entropy for ambiguous token flags).
+  \item $L_{\text{sense}}$: supervised or contrastive sense loss (CE with gold/pseudo labels or contrastive clustering loss).
+\end{itemize}
+
+\paragraph{Why}
+Adversarial training must not destroy task performance. These primary losses keep the model learning the main job: good translation and accurate span/sense predictions.
+
+\paragraph{How}
+- If gold sense labels exist for some tokens use supervised CE; otherwise use contrastive or clustering losses (as in DSCD) with prototypes.  
+- Scale these losses using $\lambda_{\text{span}}$ and $\lambda_{\text{sense}}$ to balance training.
+
+\subsection*{Step 7: Update encoder \& decoder (GRL supplies reversed gradients)}
+\paragraph{What}
+Compute total loss:
+\[
+L_{\text{total}} = L_{\text{MT}} + \lambda_{\text{span}}L_{\text{span}} + \lambda_{\text{sense}}L_{\text{sense}} + \lambda_{\text{ASBN}}L_{\text{ASBN}},
+\]
+then update encoder+DSCD+decoder parameters $\theta$ with gradient step:
+\[
+\theta \leftarrow \theta - \eta_\theta \nabla_\theta L_{\text{total}}.
+\]
+
+\paragraph{Why}
+Including $L_{\text{ASBN}}$ in the total loss ensures the encoder receives gradients that will \emph{maximize} the discriminator objectives (because of the GRL) — equivalently, the encoder is being trained to hide shortcut signals while still optimizing the main tasks.
+
+\paragraph{How}
+- In practice GRL layers in the forward graph produce negated gradients automatically for the encoder path; ensure GRL is placed on the path from $h_j$ into each discriminator.  
+- If your framework does not support per-sample GRL scalars, one practical alternative is to multiply each per-token discriminator loss $\ell_{k,j}$ by $\lambda_{k,j}$ (stop-gradient on $\lambda_{k,j}$), average, and use that as $L_k$; this produces an identical encoder gradient sign/scale effect.
+
+\section{Implementation details \& practical tips}
+\begin{enumerate}[topsep=3pt,itemsep=2pt]
+  \item \textbf{Warm-up:} Train DSCD + NMT (without strong ASBN) for 1--3 epochs so $p_j$ and $U_j$ are meaningful. Turn on ASBN after warm-up.
+  \item \textbf{Discriminator size:} use 1--2 layer MLPs with small hidden dims (32--256). Keep them weaker than encoder.
+  \item \textbf{Learning rates:} use $lr_\theta$ (encoder) $\approx 3\mathrm{e}{-4}$, $lr_\phi$ (discriminators) $\approx 1\mathrm{e}{-4}$ as starting points.
+  \item \textbf{Clipping $\lambda$ values:} prevents reversed gradients from exploding. Clip to [0,2.0] initially.
+  \item \textbf{Alternate updates:} optionally run 1--3 discriminator steps per encoder step in early phases.
+  \item \textbf{Per-sample GRL alternative:} if framework lacks per-sample GRL, weight per-sample losses by $\lambda_{k,j}$ (stop-gradient on $\lambda$), average, then backward.
+  \item \textbf{Logging:} track discriminator accuracy (should drop over time), frequency-gap metric (majority vs minority sense accuracy), average $\lambda_{k,j}$, and homograph-specific BLEU/COMET.
+  \item \textbf{Debugging:} if translation quality drops, reduce $\lambda_{\text{ASBN}}$ or $\bar{\lambda}_k$. If discriminators never degrade, increase GRL slowly.
+\end{enumerate}
+
+\section{Worked example (intuition)}
+Token: Bengali ``\textit{পাতা}'' in sentence ``\textit{সে বইয়ের পাতায় ছবি আঁকছে।}'' (expected sense: \emph{page}).
+\begin{itemize}
+  \item DSCD outputs: $p=(0.70\ \text{leaf},\ 0.28\ \text{page},\ 0.02\ \text{blade}),\; p_{\max}=0.70,\; U\approx 0.2,\; g=1$.
+  \item Compute $\lambda_{\text{freq}}\!\approx\!\bar{\lambda}_{\text{freq}}\cdot0.7\cdot(1-0.2)\!=\!\bar{\lambda}_{\text{freq}}\cdot0.56$ (non-trivial reversed gradient).
+  \item $D_{\text{freq}}$ sees that chosen sense matches majority and minimizes $L_{\text{freq}}$. GRL causes encoder to receive reversed gradient making $h_j$ more sensitive to context token \textit{বইয়ের}, shifting $p$ toward \emph{page} in subsequent steps.
+\end{itemize}
+
+\section{Hyperparameter suggestions (starting points)}
+\begin{itemize}
+  \item $\bar{\lambda}_{\text{freq}}=1.0,\; \bar{\lambda}_{\text{ctx}}=0.5,\; \bar{\lambda}_{\text{xl}}=0.8,\; \lambda_{\max}=2.0$.
+  \item $w_k=1.0$ (equal weights), $\lambda_{\text{ASBN}}=0.2$ (global multiplier, tune upwards carefully).
+  \item Discriminator hidden dim: 64; 1--2 layers with ReLU.
+  \item Warm-up: 1--3 epochs for DSCD/NMT before full ASBN.
+\end{itemize}
+
+\section*{Per-sample GRL implementation note}
+Some frameworks do not support per-sample gradient scaling inside GRL. Equivalent practical option:
+\begin{itemize}
+  \item Compute per-token discriminator losses $\ell_{k,j}$ normally (no GRL).
+  \item Multiply each $\ell_{k,j}$ by $\lambda_{k,j}$ (stop-gradient on $\lambda_{k,j}$ so discriminators optimize the original loss, not scaled $\lambda$).
+  \item Average to get $L_k = \frac{1}{N}\sum_j \lambda_{k,j}\ell_{k,j}$.
+  \item Backpropagate $L_{\text{ASBN}}$ as usual. The encoder will receive gradients scaled by $\lambda_{k,j}$ and with opposite sign if you insert a GRL-like manual sign for encoder update (or you can implement encoder update by subtracting those gradients manually). In many practical cases this weighted-loss trick is simpler and yields the intended effect.
+\end{itemize}
+
+
+
+\begin{algorithm}[H]
+\caption{ASBN Training Step (Descriptive Pseudocode)}
+\label{alg:asbn_descriptive}
+\begin{algorithmic}[1]
+
+\Require Encoder outputs (token representations), token metadata (confidence, uncertainty, frequency, context, alignment)
+
+\State \textbf{Step 1: Compute GRL strengths} 
+\State \hspace{0.5cm} \textbf{What:} Assign importance weights for each token and discriminator. 
+\State \hspace{0.5cm} \textbf{Why:} Apply stronger adversarial pressure only when bias is likely. 
+\State \hspace{0.5cm} \textbf{How:} Use model confidence, uncertainty, and ambiguity flag.
+
+\State \textbf{Step 2: Build discriminator inputs} 
+\State \hspace{0.5cm} \textbf{What:} Prepare features for each discriminator. 
+\State \hspace{0.5cm} \textbf{Why:} Each discriminator detects a different shortcut bias. 
+\State \hspace{0.5cm} \textbf{How:} 
+    \begin{itemize}
+        \item Frequency: encoder representation + frequency stats.
+        \item Context: encoder representation + context statistics.
+        \item Cross-lingual: encoder representation + aligned target embedding.
+    \end{itemize}
+
+\State \textbf{Step 3: Run discriminators and compute losses} 
+\State \hspace{0.5cm} \textbf{What:} Train discriminators to detect shortcuts. 
+\State \hspace{0.5cm} \textbf{Why:} Encourage encoder to hide shortcut signals. 
+\State \hspace{0.5cm} \textbf{How:} Forward pass inputs, compare with labels, compute losses.
+
+\State \textbf{Step 4: Aggregate ASBN loss} 
+\State \hspace{0.5cm} \textbf{What:} Combine discriminator losses. 
+\State \hspace{0.5cm} \textbf{Why:} Balance multiple shortcut detectors. 
+\State \hspace{0.5cm} \textbf{How:} Weighted sum of frequency, context, and cross-lingual losses.
+
+\State \textbf{Step 5: Update discriminators} 
+\State \hspace{0.5cm} \textbf{What:} Optimize discriminators to improve shortcut detection. 
+\State \hspace{0.5cm} \textbf{Why:} Keep adversarial game strong. 
+\State \hspace{0.5cm} \textbf{How:} Perform gradient descent minimizing ASBN loss (update only discriminator parameters).
+
+\State \textbf{Step 6: Compute main model losses} 
+\State \hspace{0.5cm} \textbf{What:} Calculate translation, span, and sense losses. 
+\State \hspace{0.5cm} \textbf{Why:} Maintain task-specific objectives as the core training signal. 
+\State \hspace{0.5cm} \textbf{How:} Use standard NMT and DSCD loss functions.
+
+\State \textbf{Step 7: Update encoder and decoder} 
+\State \hspace{0.5cm} \textbf{What:} Train encoder and decoder with task + adversarial objectives. 
+\State \hspace{0.5cm} \textbf{Why:} Make encoder sense-aware while reducing shortcut reliance. 
+\State \hspace{0.5cm} \textbf{How:} Combine all losses, apply GRL to reverse discriminator gradients, update model parameters.
+
+\Ensure Updated encoder \& decoder (less biased, more sense-aware), and trained discriminators.
+
+\end{algorithmic}
+\end{algorithm}
+\end{document}

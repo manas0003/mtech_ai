@@ -1,0 +1,508 @@
+\documentclass[a4paper,12pt]{article}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{caption}
+\usepackage{booktabs}
+\geometry{margin=1in}
+\setlist{nosep}
+
+\begin{document}
+
+\title{Revised DSCD (Dynamic Span--Sense Co--Detection)}
+\author{}
+\date{}
+\maketitle
+
+\begin{abstract}
+This document gives the full Revised DSCD algorithm: notation, motivations, mathematical definitions, and a compact pseudocode implementation. The method runs online, supports dynamic (per-word) sense prototypes, computes combined predictive uncertainty, and integrates attention gating, span detection, and sense-augmentation in a single forward pass.
+\end{abstract}
+
+\section*{Revised architecture of DSCD module}
+
+\paragraph{1. Data Setup:} This is the foundation-building phase before any sentence is processed by DSCD.
+\begin{enumerate}
+    \item We set up the tools that will be used throughout the pipeline (tokenizer, encoder, decoder).
+    \item We prepare storage for prototypes and embedding buffers.
+    \item We load hyperparameters that control when and how clustering happens.
+\end{enumerate}
+This ensures that as soon as the first sentence comes in, the algorithm can dynamically start building sense clusters without manual intervention.
+
+\begin{itemize}
+    \item A. Tokenizer Setup,
+    \item B. Encoder/Decoder Initialization,
+    \item C. Embedding Buffers: For each token type \texttt{www}, allocate a fixed-size circular buffer to store recent embeddings for type-level dispersion checks.
+    \item D. Hyperparameter Initialization,
+\end{itemize}
+
+\paragraph{2. Preprocessing:} Cleaning, Normalizing, Subword tokenization, Subword tokenization (SentencePiece)
+
+\paragraph{3. Contextual Encoding}
+
+\paragraph{4. Maintain Per-Type Embedding Buffer \& Compute Dispersion:}
+Keep a rolling buffer $B_w$ for each token type $w$ (word or subword string). This buffer stores the most recent $C$ contextual embeddings $h_j$ for that type.
+
+Then calculate the dispersion --- how much variation exists among those embeddings.
+
+\begin{itemize}
+    \item If the embeddings are close together $\rightarrow$ the token likely has one meaning (monosemous).
+    \item If they are spread out $\rightarrow$ the token likely has multiple meanings (polysemous), so we need to track senses dynamically.
+\end{itemize}
+
+\textbf{Why important:}
+\begin{enumerate}
+    \item Saves computation: We avoid running expensive prototype matching and uncertainty estimation on words that clearly have only one meaning.
+    \item Data-driven ambiguity detection: We don’t rely on a fixed list of ambiguous words --- the model learns which words vary in meaning from the actual embeddings it sees.
+    \item Adapts to domain/language: In one domain, ``mouse'' might mean only the computer device; in another, it could refer to both the animal and the device --- dispersion will reveal this automatically.
+\end{enumerate}
+
+\paragraph{5. Predictive Uncertainty Computation:} This step’s goal is to quantify how sure or unsure the model is about which sense a given token should take, by combining multiple types of uncertainty.
+
+\begin{itemize}
+    \item High values suggest the token might be ambiguous, noisy, or even a new unseen sense.
+    \item Low values suggest the token is confidently assigned to an existing sense.
+\end{itemize}
+
+\subsection*{a. If no prototypes exist for token type $w$:}
+Means we encounter a word type $w$ for the first time; there are no sense clusters (prototypes) yet. So there are two options:
+
+\begin{itemize}
+    \item A. Immediate creation — make the first prototype $c_{w,1}$ from this token’s embedding $h_j$.
+    \item B. Wait-and-see — store embeddings in a temporary buffer $B_w$ until we have at least $N_{\min}$ examples, then initialize prototypes from that set.
+\end{itemize}
+
+Why it is needed: Immediate creation reacts faster but risks making bad prototypes from noisy single examples. Waiting prevents noise problems in low-data settings.
+
+\subsection*{b. If prototypes exist:}
+\begin{enumerate}
+    \item Compute similarity between $h_j$ and each existing prototype $c_{w,i}$. It measures closeness in meaning.
+    \item Turn similarities into probabilities over senses with a softmax.
+
+    Softmax converts similarities into a probabilistic sense.
+    \item Compute entropy --- high entropy means uncertainty between senses. Entropy captures ambiguity.
+    \item Compute distance $d_{\min}$ --- distance to closest prototype; large values suggest a possible new sense. It detects completely new senses far from all known ones.
+\end{enumerate}
+
+\subsection*{c. MC-Dropout for Epistemic Uncertainty:}
+It runs the model $M$ times with dropout active at inference time, giving different $p_j^{(m)}$ each run. It computes the variance of these probabilities across runs.
+
+It captures epistemic uncertainty --- uncertainty due to model parameters not being fully certain which is common with small or skewed training data.
+
+High variance means the model’s parameters are not confident for this token.
+
+\subsection*{d. $\sigma$-Net for Heteroscedastic (Data) Uncertainty:}
+A small MLP ($\sigma$-Net) predicts the log variance of the sense prediction from $h_j$.
+
+This models noise that varies by instance --- e.g., rare words, OCR errors etc.
+
+Why: Some tokens are inherently harder to disambiguate due to noisy input; $\sigma$-Net learns to spot these without being confused with semantic ambiguity.
+
+\subsection*{e. Combined uncertainty score:}
+Combine the above uncertainties into one master uncertainty score.
+
+Why: A single number makes it easier for the gating logic in later steps to decide whether to boost attention, create a new prototype, or ignore the token.
+
+The weights $\alpha$ adjust the importance of each uncertainty type. It combines:
+\begin{enumerate}
+    \item Entropy,
+    \item Heteroscedastic uncertainty,
+    \item Epistemic uncertainty,
+    \item Distance.
+\end{enumerate}
+It merges them into a single unified uncertainty score $U_j$ using a weighted linear combination.
+
+\paragraph{6. Online Dynamic Clustering (Create / Assign / Update Prototypes):}
+This step decides, for each token, whether:
+\begin{itemize}
+    \item It belongs to an already known sense of the word (assign to an existing prototype), or
+    \item It represents a new sense not yet captured by the system (create a new prototype).
+\end{itemize}
+
+The process has three key sub-steps:
+\begin{enumerate}
+    \item Measure distance: For the current token embedding $h_j$, compute its minimum cosine distance to any existing prototype $c_{w,i}$. This tells us how far this token is from the most similar known sense.
+    \item Adaptive Threshold for Creation: We don’t use a fixed global threshold --- instead, we compute adaptive threshold. This makes the threshold custom to each word and its natural variability.
+    \item Assign \& Update Existing Prototypes: If the token is not novel enough:
+    \begin{itemize}
+        \item Find the closest prototype,
+        \item Update that prototype using Exponential Moving Average (EMA).
+    \end{itemize}
+    
+    Prototypes are only marked as stable once they’ve had at least $N_{\min}$ assignments --- this prevents accidental ``senses'' from single noisy examples.
+\end{enumerate}
+
+Why EMA is used:
+\begin{itemize}
+    \item Prevents a single unusual occurrence from dragging the prototype away from its true center.
+    \item Allows slow adaptation if the sense’s embedding distribution shifts over time.
+\end{itemize}
+
+\paragraph{7. Instance-Level Flagging \& Attention Gating:}
+In this step, we decide which specific tokens in the current sentence deserve special treatment because they are likely ambiguous or uncertain.
+
+We don’t boost attention for every word --- only for those where uncertainty is significant.
+
+Two main actions happen here:
+\begin{enumerate}
+    \item Flagging: Mark tokens as ``important'' if they’re both of a potentially multi-sense word type and individually have high uncertainty.
+    \item Attention Gating: Adjust the model’s attention mechanism so the decoder focuses more on these flagged tokens during translation or downstream tasks.
+\end{enumerate}
+
+Why:
+\begin{enumerate}
+    \item Not all words are equally important for disambiguation.
+    \item By boosting attention to only the important tokens:
+    \begin{itemize}
+        \item The decoder can spend more capacity resolving their meaning.
+        \item Reduces noise from unimportant tokens.
+        \item Improves translation quality and sense prediction without slowing everything down.
+    \end{itemize}
+\end{enumerate}
+
+Steps: This step combines type-level and instance-level information:
+\begin{enumerate}
+    \item Candidate Type Filtering: from step 4 we have a dispersion score $D_w$ for each word type. If $D_w > \delta_{type}$ (Type-Level Dispersion Threshold), that word type is likely multi-sense and becomes a candidate for instance-level inspection.
+    \item Instance-Level Check: we have each token’s uncertainty score $U_j$. If the token’s type is a candidate and $U_j > \delta_{inst}$ (Instance-Level Uncertainty Threshold) then the token is flagged for attention boosting.
+    \item Learnable Attention Gate: For each flagged token $j$, compute a gate value $g_j$ using a learnable sigmoid. Higher $g_j$ means larger attention boost.
+    \item Apply Attention Boost: It ensures ambiguous tokens get more focus than normal.
+    \item Renormalize Attention: It maintains valid attention semantics while still preserving the relative boost given to flagged tokens.
+\end{enumerate}
+
+\paragraph{8. Joint Span Detection \& Sense Label Selection:}
+This step is two tasks combined into one:
+\begin{enumerate}
+    \item Span Detection – Decide which tokens in the sentence are part of an ambiguous phrase (e.g., ``bank of the river'' $\rightarrow$ ``bank'' is ambiguous).
+    \item Sense Label Selection – For those ambiguous tokens, decide which meaning/sense applies in the current context.
+\end{enumerate}
+
+Why: In dynamic sense disambiguation, it’s not enough to just guess a sense for every word. Most words are not ambiguous in their context --- so sense prediction should be focused only where needed.
+
+By detecting spans:
+\begin{itemize}
+    \item The model avoids wasting computation on non-ambiguous tokens.
+    \item It can gate sense-aware processing, reducing noise and improving efficiency.
+\end{itemize}
+
+Sense labels are necessary to feed explicit sense information into downstream modules like translation.
+
+Steps:
+\begin{enumerate}
+    \item Span Detection (Binary Classification),
+    \item Sense Label Selection: use clustering assignment to assign a sense using prototype assignment who has highest similarity.
+\end{enumerate}
+
+\paragraph{9. Sense-Augmented Embedding Construction:}
+This step enhances the model’s internal representation of a token by merging its contextual embedding with the embedding of its predicted sense.
+
+Contextual embedding $h_j$ comes from the encoder, representing the token’s meaning in its sentence context.
+
+Prototype embedding $c_{w,y_j}$ represents the learned vector for the specific sense of the token type $w$.
+
+The output is a sense-augmented embedding $h_j'$ that combines both.
+
+Why: Even if the encoder captures context, ambiguous words can have overlapping vector spaces.
+
+By adding the sense prototype vector to the contextual vector:
+\begin{enumerate}
+    \item We give the decoder direct, explicit sense cues.
+    \item It becomes easier for the downstream generator to differentiate senses without relying on context alone.
+    \item This helps rare or new senses propagate into translation or other tasks immediately after being detected.
+\end{enumerate}
+
+Steps:
+\begin{enumerate}
+    \item Check if token is flagged as ambiguous,
+    \item If ambiguous: Retrieve its assigned sense prototype from Step 6. Add this prototype to the contextual embedding.
+    \item If not ambiguous: Keep the contextual embedding unchanged.
+    \item Pass $h_j'$ to the decoder. This modified embedding directly influences attention scores and output token probabilities in translation or generation.
+\end{enumerate}
+
+\hrulefill
+
+\paragraph{MC dropout -- Monte Carlo Dropout.}
+\begin{itemize}
+    \item It’s a technique where we keep dropout layers active during inference (not just during training) and run the model multiple times to get different predictions for the same input.
+    \item Normally, dropout randomly zeros out some neurons during training to prevent overfitting.
+    \item In MC Dropout, we deliberately keep this randomness on during prediction to sample multiple outputs from the model.
+    \item The variation between these outputs tells us how uncertain the model is due to limited or noisy training data.
+\end{itemize}
+
+Why: We use it for Epistemic Uncertainty (MC-Dropout): we want to know if the model parameters themselves are uncertain about a token’s sense --- this is called epistemic uncertainty.
+
+\begin{itemize}
+    \item If the model is confident $\rightarrow$ all MC dropout runs give similar predictions.
+    \item If the model is uncertain $\rightarrow$ predictions will vary a lot.
+\end{itemize}
+
+\paragraph{$\sigma$-Net for Heteroscedastic (Data) Uncertainty:}
+$\sigma$-Net is a small neural network (usually an MLP) that predicts how noisy or uncertain the data is for a specific token given its context. This is called heteroscedastic uncertainty because the noise level can change for each input token --- it’s not constant. If the token’s context is noisy, rare, or ambiguous, $\sigma$-Net will predict a higher variance; if the token is clear and common, it predicts a low variance.
+
+Sometimes a token is inherently ambiguous in the sentence because of poor context, OCR errors, spelling variations, or mixed-language usage.
+
+This uncertainty is data-driven, not model-driven:
+\begin{itemize}
+    \item Model-driven uncertainty $\rightarrow$ epistemic $\rightarrow$ handled by MC Dropout.
+    \item Data-driven uncertainty $\rightarrow$ heteroscedastic $\rightarrow$ handled by $\sigma$-Net.
+\end{itemize}
+
+$\sigma$-Net lets DSCD downweight or treat cautiously tokens from noisy contexts.
+
+\bigskip
+
+\section*{Revised DSCD (Dynamic Span–Sense Co–Detection)}
+
+\subsection*{Full algorithm (online dynamic clustering \& uncertainty-aware attention)}
+
+\paragraph{Notation (short)}
+\begin{itemize}
+    \item Input sentence (subwords): $S = [s_1, \ldots, s_L]$.
+    \item Token index: $j$. Token type (subword string): $w = s_j$.
+    \item Encoder output (contextual embedding): $h_j \in \mathbb{R}^d$.
+    \item Prototype set (dynamic) for type $w$: $C_w = \{c_{w,1}, \ldots, c_{w,K_w}\}$. Note $K_w$ varies (per-word).
+    \item Temperature: $T > 0$. Dropout MC samples: $M$. EMA rate for centroid update: $\eta$.
+    \item Buffer of recent embeddings for $w$: $B_w$ (size $C$).
+    \item Base attention score (from encoder/decoder cross-attention): $a^{(0)}_j$.
+    \item Span head params: $W_{\text{span}}, b_{\text{span}}$.
+    \item Hyperparameters: $\delta_{\text{type}}, \delta_{\text{inst}}, \varepsilon_{\text{new}}, \lambda_{\text{merge}}, N_{\min},$ etc.
+\end{itemize}
+
+\subsection*{Overview}
+The pipeline does: preprocess $\rightarrow$ encode $\rightarrow$ compute per-type dispersion $\rightarrow$ compute per-token predictive uncertainty (over current per-type prototypes) $\rightarrow$ dynamic clustering (create / assign / update prototypes online) $\rightarrow$ uncertainty-gated attention boost $\rightarrow$ joint span detection \& sense assignment $\rightarrow$ sense-augmented embeddings $\rightarrow$ decode. All operations are compatible with single-sentence / low-latency translation.
+
+\section*{0. Initialization / data setup}
+\begin{itemize}
+    \item Train / load SentencePiece/BPE. Initialize encoder/decoder (prefer pretrained if small-data).
+    \item Initialize prototype store: for each encountered type $w$, set $C_w = \varnothing$. Maintain buffers $B_w$.
+    \item Choose default hyperparameters (examples in text).
+\end{itemize}
+
+\section*{1. Preprocessing \& Subword segmentation}
+Given raw sentence $S_{\text{raw}}$: clean / normalize, segment with SentencePiece to obtain $S = [s_1, \ldots, s_L]$. Rationale: subwords reduce OOV failure and help build contextual embeddings for rare forms.
+
+\section*{2. Contextual encoding}
+For each token $j$:
+\[
+h_j = \text{Encoder}(s_j) \in \mathbb{R}^d.
+\]
+The encoder should be context-aware (Transformer/BiLSTM), ideally pre-trained when data is small.
+
+\section*{3. Per-type embedding buffer \& dispersion (type-level)}
+Append $h_j$ to circular buffer $B_w$ (capacity $C$). Periodically compute dispersion:
+
+\[
+\bar{h}_w = \frac{1}{|B_w|} \sum_{x \in B_w} x, \qquad
+D_w = \frac{1}{|B_w|} \sum_{x \in B_w} \|x - \bar{h}_w\|_2^2.
+\]
+
+If $D_w > \delta_{\text{type}}$ then mark type $w$ as a candidate for multi-sense processing. This avoids spending compute on monosemous types.
+
+\section*{4. Predictive uncertainty computation (per token) --- dynamic over current prototypes}
+This step computes sense probabilities and multiple uncertainty signals for token $j$ of type $w$.
+
+\subsection*{4.1 If $C_w = \varnothing$}
+\begin{itemize}
+    \item Option A (fast): create first prototype immediately
+    \[
+    c_{w,1} \leftarrow h_j, \quad K_w \leftarrow 1.
+    \]
+    \item Option B (safer for noisy / small-data): append $h_j$ to a temporary buffer and create prototype only after $N_{\min}$ examples.
+\end{itemize}
+Output (initial): $p_j = [1.0]$, $H_j = 0$, $d_{\min} = 0$.
+
+\subsection*{4.2 Else ($C_w$ nonempty) --- per-prototype similarity \& distribution}
+Compute cosine similarities (normalize vectors first):
+
+\[
+s_{j,i} = \cos(h_j, c_{w,i}) = \frac{h_j^\top c_{w,i}}{\|h_j\| \, \|c_{w,i}\|}, \qquad i = 1, \ldots, K_w.
+\]
+
+Turn similarities into probabilities (temperature-scaled softmax over the current $K_w$):
+
+\[
+p_{j,i} = \frac{\exp(s_{j,i}/T)}{\sum_{k=1}^{K_w} \exp(s_{j,k}/T)}, \qquad i = 1..K_w.
+\]
+
+Aleatoric uncertainty (instance entropy):
+
+\[
+H_j = -\sum_{i=1}^{K_w} p_{j,i} \log(p_{j,i} + \epsilon).
+\]
+
+Novelty metric (cosine distance to closest centroid):
+
+\[
+d_{\min} = \min_i (1 - s_{j,i}).
+\]
+
+\subsection*{4.3 Epistemic uncertainty (MC-dropout)}
+Run $M$ stochastic forward passes (dropout active), recompute $p_j^{(m)}$ per pass:
+
+\[
+\bar{p}_j = \frac{1}{M} \sum_{m=1}^M p_j^{(m)}, \qquad
+\text{Var}_j = \frac{1}{M} \sum_{m=1}^M \| p_j^{(m)} - \bar{p}_j \|^2.
+\]
+
+This captures model-parameter uncertainty.
+
+\subsection*{4.4 $\sigma$-Net (learned heteroscedastic)}
+A small MLP predicts log-variance:
+
+\[
+u_j = W_\sigma h_j + b_\sigma, \qquad \sigma_j = \exp\left(\frac{1}{2} u_j\right).
+\]
+
+This estimates per-token data-driven noise.
+
+\subsection*{4.5 Combined uncertainty score}
+Combine signals (learnable or validated coefficients $\alpha$):
+
+\[
+U_j = \alpha_1 H_j + \alpha_2 \sigma_j + \alpha_3 \text{Var}_j + \alpha_4 \cdot \text{norm}(d_{\min}).
+\]
+
+This single scalar $U_j$ is used downstream for gating, flagging, and to help decide whether to create a new prototype.
+
+\section*{5. Online dynamic clustering (create / assign / update prototypes)}
+Maintain per-type assignment-distance history (rolling mean $\mu_w$ and std $\tau_w$). Set an adaptive creation threshold:
+
+\[
+\varepsilon_{\text{new},w} = \mu_w + \lambda \tau_w.
+\]
+
+For token $j$:
+\begin{itemize}
+    \item If $d_{\min} > \varepsilon_{\text{new},w}$ (and optionally $U_j > \delta_{\text{inst}}$), create a new prototype:
+    \[
+    K_w \leftarrow K_w + 1, \quad c_{w,K_w} \leftarrow h_j.
+    \]
+    \item Else assign to nearest prototype $i^\star = \arg\max_i s_{j,i}$ and update centroid by EMA:
+    \[
+    c_{w,i^\star} \leftarrow (1-\eta) c_{w,i^\star} + \eta h_j.
+    \]
+    \item Optionally require newly created prototypes to receive $N_{\min}$ assignments before declared stable.
+\end{itemize}
+
+Remarks: thresholds are adaptive (per-type), EMA keeps centroids stable while letting them drift with new contexts.
+
+\section*{6. Instance-level flagging \& attention gating}
+Type $w$ is a candidate if $D_w > \delta_{\text{type}}$. Token $j$ is flagged if $w$ is candidate and $U_j > \delta_{\text{inst}}$. Collect flagged set $\mathcal{C}$.
+
+For each flagged $j$ compute a learnable sigmoid gate:
+
+\[
+g_j = \sigma\big(w_g (U_j - b_g)\big) \in (0,1),
+\]
+
+boost the base attention:
+
+\[
+a_j = a_j^{(0)} \cdot (1 + \gamma g_j),
+\]
+
+and then renormalize:
+
+\[
+\tilde{a}_j = \frac{a_j}{\sum_{k=1}^L a_k}.
+\]
+
+This lets the model focus more on uncertain tokens.
+
+\section*{7. Joint span detection \& sense label selection}
+Span detector (binary):
+
+\[
+\hat{b}_j = \sigma(W_{\text{span}} h_j + b_{\text{span}}).
+\]
+
+Sense selection: use clustering assignment $\hat{y}_j$ from step 5 (or $\arg\max_i p_{j,i}$ for soft selection). If you have pseudo/gold sense labels, apply cross-entropy supervision on assignments; otherwise use clustering/contrastive losses.
+
+\section*{8. Sense-augmented embedding}
+If $\hat{b}_j > 0.5$ (or $j$ flagged), augment:
+
+\[
+h_j' = h_j + c_{w,\hat{y}_j},
+\]
+else $h_j' = h_j$. The decoder receives sense-conditioned vectors.
+
+\section*{9. Decoder \& generation}
+Pass $\{h_j'\}$ and normalized attention $\{\tilde{a}_j\}$ to the decoder to generate target tokens (beam search / greedy as usual).
+
+\section*{10. Loss \& training objective}
+Per-sentence loss (batch average):
+
+\[
+\mathcal{L} = \mathcal{L}_{\text{MT}} + \lambda_{\text{span}} \sum_j \text{BCE}(b_j, \hat{b}_j) + \lambda_{\text{sense}} \sum_{j \in \mathcal{C}} \text{CE}(y_j^{(\text{pseudo})}, \hat{p}_j) + \lambda_{\text{reg}} R,
+\]
+where $\mathcal{L}_{\text{MT}} = \sum_t \text{CE}(\text{target}_t, \text{pred}_t)$. If no pseudo sense labels are available, replace the sense supervision term with contrastive or clustering losses (examples below). $R$ includes centroid-stability and prototype-count penalties to prevent explosion.
+
+\subsection*{Optional contrastive clustering loss}
+For positively paired (instance, prototype) samples $P$:
+
+\[
+\mathcal{L}_{\text{contra}} = - \sum_{(i,k) \in P} \log \frac{\exp(\cos(h_i, c_{w,k})/\tau)}{\sum_m \exp(\cos(h_i, c_{w,m})/\tau)}.
+\]
+
+\section*{Practical variants: small-data vs large-data}
+\begin{itemize}
+    \item \textbf{Large data:} allow more aggressive new-prototype creation (lower $\varepsilon_{\text{new},w}$), larger buffers $C$, periodic offline mini-KMeans refinements.
+    \item \textbf{Small data:} use safe buffering (do not create prototype until $N_{\min}$), raise $\varepsilon_{\text{new},w}$, use pretrained encoder, use pseudo-labels / alignments to bootstrap prototypes, penalize prototype count.
+\end{itemize}
+
+\section*{Hyperparameter suggestions (initial)}
+\begin{itemize}
+    \item Buffer size $C$: 100 (small) -- 1000 (large).
+    \item EMA rate $\eta$: 0.03--0.08.
+    \item MC-dropout passes $M$: 3 (fast) -- 8 (robust).
+    \item Temperature $T$: 0.6--1.0.
+    \item New-cluster factor $\lambda$ in $\varepsilon_{\text{new},w} = \mu_w + \lambda \tau_w$: 1.0--2.0.
+    \item $N_{\min}$ for prototype stabilization: 3--10.
+    \item Max prototypes per type $K_{\max}$: 20 (practical cap).
+    \item Gate init: $w_g = 10$, $b_g = 0.5$, $\gamma = 0.5$.
+\end{itemize}
+
+\section*{Compact pseudocode (core functions)}
+
+\noindent\textbf{Algorithm 1 Core DSCD forward-pass (per sentence)}\\
+Require: sentence $S = [s_1, \ldots, s_L]$
+\begin{algorithmic}[1]
+\FOR{each token $j$ in $S$}
+    \STATE $h_j \leftarrow \text{Encoder}(s_j)$
+    \STATE append $h_j$ to buffer $B_{s_j}$
+\ENDFOR
+\STATE compute/update dispersion $D_w$ for relevant types
+\FOR{each token $j$}
+    \STATE compute (or create) prototypes $C_w$ status
+    \STATE compute similarities $s_{j,i}$ and $p_{j,i}$ over current $C_w$
+    \STATE compute $H_j$, $\text{Var}_j$ (MC), $\sigma_j$ ($\sigma$-net), $d_{\min}$
+    \STATE combine $U_j \leftarrow \alpha_1 H_j + \alpha_2 \sigma_j + \alpha_3 \text{Var}_j + \alpha_4 \text{norm}(d_{\min})$
+    \IF{$d_{\min} > \varepsilon_{\text{new},w}$ and $U_j > \delta_{\text{inst}}$}
+        \STATE create new prototype $c_{w,K_w+1} \leftarrow h_j$
+    \ELSE
+        \STATE assign to nearest prototype $i^\star$ and update $c_{w,i^\star} \leftarrow (1-\eta) c_{w,i^\star} + \eta h_j$
+    \ENDIF
+\ENDFOR
+\STATE compute gating $g_j = \sigma(w_g(U_j - b_g))$ for flagged tokens, boost attention $a_j$, renormalize
+\STATE compute span predictions $\hat{b}_j$ and sense id $\hat{y}_j$ (from clustering)
+\STATE form $h_j' = h_j + c_{w,\hat{y}_j}$ for flagged spans
+\STATE feed $\{h_j'\}, \{\tilde{a}_j\}$ to decoder and compute $\mathcal{L}$
+\end{algorithmic}
+
+\section*{Monitoring \& diagnostics}
+Monitor: span detection F1, prototype creation rate, cluster sizes per type, average entropy for flagged vs unflagged tokens, translation BLEU/COMET on homograph-rich test sets. Log newly created prototypes with sample contexts for inspection.
+
+\section*{Closing remarks}
+This LaTeX document encodes the full mathematical DSCD pipeline with dynamic, online clustering and robust multi-source uncertainty. For code-level implementation adapt the pseudocode above into your framework (PyTorch/TensorFlow). Tune prototype-creation thresholds and prototype-stability parameters according to domain size and noise level.
+
+\bigskip
+
+If you want: I can provide
+\begin{enumerate}
+    \item a ready-to-run PyTorch-style implementation sketch for the forward pass and centroid store, or
+    \item a short Overleaf-friendly figure/table showing the data flow.
+\end{enumerate}
+
+\end{document}
